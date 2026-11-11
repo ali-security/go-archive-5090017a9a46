@@ -11,6 +11,12 @@ import (
 	"time"
 )
 
+// isPathEscapes reports whether err is the path-containment error returned
+// when resolving a path within the extraction root escapes the root.
+func isPathEscapes(err error) bool {
+	return errors.Is(err, errPathEscapes)
+}
+
 var testUntarFns = map[string]func(string, io.Reader) error{
 	"untar": func(dest string, r io.Reader) error {
 		return Untar(r, dest, nil)
@@ -76,7 +82,7 @@ func testBreakout(untarFn string, tmpdir string, headers []*tar.Header) error {
 		return fmt.Errorf("could not find untar function %q in testUntarFns", untarFn)
 	}
 	if err := untar(dest, reader); err != nil {
-		if !errors.As(err, new(breakoutError)) {
+		if !errors.As(err, new(breakoutError)) && !isPathEscapes(err) {
 			// If untar returns an error unrelated to an archive breakout,
 			// then consider this an unexpected error and abort.
 			return err

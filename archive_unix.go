@@ -70,9 +70,12 @@ func handleTarTypeBlockCharFifo(hdr *tar.Header, path string) error {
 	return mknod(path, mode, unix.Mkdev(uint32(hdr.Devmajor), uint32(hdr.Devminor)))
 }
 
-func handleLChmod(hdr *tar.Header, path string, hdrInfo os.FileInfo) error {
+// handleLChmod applies the mode from hdrInfo to path, skipping symlinks (there
+// is no lchmod). For hardlinks, the mode is applied only when hardlinkTarget,
+// the link target resolved within the extraction root, is not a symlink.
+func handleLChmod(hdr *tar.Header, path, hardlinkTarget string, hdrInfo os.FileInfo) error {
 	if hdr.Typeflag == tar.TypeLink {
-		if fi, err := os.Lstat(hdr.Linkname); err == nil && (fi.Mode()&os.ModeSymlink == 0) {
+		if fi, err := os.Lstat(hardlinkTarget); err == nil && (fi.Mode()&os.ModeSymlink == 0) {
 			if err := os.Chmod(path, hdrInfo.Mode()); err != nil {
 				return err
 			}

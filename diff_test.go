@@ -2,6 +2,7 @@ package archive
 
 import (
 	"archive/tar"
+	"bytes"
 	"io"
 	"os"
 	"path/filepath"
@@ -307,6 +308,94 @@ func TestApplyLayerWhiteouts(t *testing.T) {
 		if !reflect.DeepEqual(tc.expected, paths) {
 			t.Fatalf("invalid files for layer %d: expected %q, got %q", i, tc.expected, paths)
 		}
+	}
+}
+
+// TestUnpackLayerWhiteoutContained verifies that whiteout entries cannot
+// remove files outside the extraction root (or the extraction root itself),
+// either through a whiteout name referring to a parent directory, or through
+// a symlink in the parent path of the whiteout.
+func TestUnpackLayerWhiteoutContained(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		headers func(victim string) []*tar.Header
+	}{
+		{
+			name: "whiteout parent of root",
+			headers: func(string) []*tar.Header {
+				return []*tar.Header{
+					{Name: WhiteoutPrefix + "..", Typeflag: tar.TypeReg, Mode: 0o644},
+				}
+			},
+		},
+		{
+			name: "whiteout root",
+			headers: func(string) []*tar.Header {
+				return []*tar.Header{
+					{Name: "sub/" + WhiteoutPrefix + "..", Typeflag: tar.TypeReg, Mode: 0o644},
+				}
+			},
+		},
+		{
+			name: "whiteout through absolute symlink",
+			headers: func(victim string) []*tar.Header {
+				return []*tar.Header{
+					{Name: "escape", Typeflag: tar.TypeSymlink, Linkname: victim},
+					{Name: "escape/" + WhiteoutPrefix + "hello", Typeflag: tar.TypeReg, Mode: 0o644},
+				}
+			},
+		},
+		{
+			name: "opaque whiteout through absolute symlink",
+			headers: func(victim string) []*tar.Header {
+				return []*tar.Header{
+					{Name: "escape", Typeflag: tar.TypeSymlink, Linkname: victim},
+					{Name: "escape/sub/" + WhiteoutOpaqueDir, Typeflag: tar.TypeReg, Mode: 0o644},
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpdir := t.TempDir()
+			dest := filepath.Join(tmpdir, "dest")
+			victim := filepath.Join(tmpdir, "victim")
+			if err := os.MkdirAll(filepath.Join(dest, "sub"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Join(victim, "sub"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(victim, "hello"), []byte("hello"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(victim, "sub", "file"), []byte("file"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			buf := &bytes.Buffer{}
+			tw := tar.NewWriter(buf)
+			for _, hdr := range tc.headers(victim) {
+				if err := tw.WriteHeader(hdr); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := tw.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			// May error; we only require containment.
+			_, _ = UnpackLayer(dest, buf, &TarOptions{NoLchown: true})
+
+			for _, p := range []string{
+				filepath.Join(dest, "sub"),
+				filepath.Join(victim, "hello"),
+				filepath.Join(victim, "sub", "file"),
+			} {
+				if _, err := os.Lstat(p); err != nil {
+					t.Errorf("archive breakout: whiteout removed %q: %v", p, err)
+				}
+			}
+		})
 	}
 }
 

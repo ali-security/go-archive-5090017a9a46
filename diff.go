@@ -2,16 +2,12 @@ package archive
 
 import (
 	"archive/tar"
-	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
-
-	"github.com/containerd/log"
 
 	"github.com/moby/go-archive/compression"
 )
@@ -22,7 +18,7 @@ import (
 func UnpackLayer(dest string, layer io.Reader, options *TarOptions) (size int64, err error) {
 	tr := tar.NewReader(layer)
 
-	var dirs []*tar.Header
+	var dirs []unpackedDir
 	unpackedPaths := make(map[string]struct{})
 
 	if options == nil {
@@ -48,9 +44,9 @@ func UnpackLayer(dest string, layer io.Reader, options *TarOptions) (size int64,
 
 		size += hdr.Size
 
-		// Normalize name, for safety and for a simple is-root check
-		hdr.Name = filepath.Clean(hdr.Name)
-
+		// Normalize the name, skip entries referring to the extraction root,
+		// and reject names that escape it.
+		//
 		// Windows does not support filenames with colons in them. Ignore
 		// these files. This is not a problem though (although it might
 		// appear that it is). Let's suppose a client is running docker pull.
@@ -65,17 +61,10 @@ func UnpackLayer(dest string, layer io.Reader, options *TarOptions) (size int64,
 		// specific or Linux-specific, this warning should be changed to an error
 		// to cater for the situation where someone does manage to upload a Linux
 		// image but have it tagged as Windows inadvertently.
-		if runtime.GOOS == "windows" {
-			if strings.Contains(hdr.Name, ":") {
-				log.G(context.TODO()).Warnf("Windows: Ignoring %s (is this a Linux image?)", hdr.Name)
-				continue
-			}
-		}
-
-		// Ensure that the parent directory exists.
-		err = createImpliedDirectories(dest, hdr, options)
-		if err != nil {
+		if skip, err := normalizeEntryName(hdr); err != nil {
 			return 0, err
+		} else if skip {
+			continue
 		}
 
 		// Skip AUFS metadata dirs
@@ -101,38 +90,43 @@ func UnpackLayer(dest string, layer io.Reader, options *TarOptions) (size int64,
 				continue
 			}
 		}
-		// #nosec G305 -- The joined path is guarded against path traversal.
-		path := filepath.Join(dest, hdr.Name)
-		rel, err := filepath.Rel(dest, path)
+		// Resolve symlinks in the parent directories within dest, so that
+		// symlinks in the destination (including ones created by earlier
+		// entries of this layer) cannot redirect the entry outside dest.
+		name, err := resolveArchivePath(dest, hdr.Name)
 		if err != nil {
 			return 0, err
 		}
 
-		// Note as these operations are platform specific, so must the slash be.
-		if strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-			return 0, breakoutError(fmt.Errorf("%q is outside of %q", hdr.Name, dest))
+		// Ensure that the parent directory exists.
+		err = createImpliedDirectories(dest, name, options)
+		if err != nil {
+			return 0, err
 		}
-		base := filepath.Base(path)
+
+		// #nosec G305 -- The name is resolved within dest.
+		dstPath := filepath.Join(dest, name)
+		base := filepath.Base(dstPath)
 
 		if strings.HasPrefix(base, WhiteoutPrefix) {
-			dir := filepath.Dir(path)
+			dir := filepath.Dir(dstPath)
 			if base == WhiteoutOpaqueDir {
 				_, err := os.Lstat(dir)
 				if err != nil {
 					return 0, err
 				}
-				err = filepath.WalkDir(dir, func(path string, info os.DirEntry, err error) error {
+				err = filepath.WalkDir(dir, func(p string, info os.DirEntry, err error) error {
 					if err != nil {
 						if os.IsNotExist(err) {
 							err = nil // parent was deleted
 						}
 						return err
 					}
-					if path == dir {
+					if p == dir {
 						return nil
 					}
-					if _, exists := unpackedPaths[path]; !exists {
-						return os.RemoveAll(path)
+					if _, exists := unpackedPaths[p]; !exists {
+						return os.RemoveAll(p)
 					}
 					return nil
 				})
@@ -142,18 +136,24 @@ func UnpackLayer(dest string, layer io.Reader, options *TarOptions) (size int64,
 			} else {
 				originalBase := base[len(WhiteoutPrefix):]
 				originalPath := filepath.Join(dir, originalBase)
+
+				// The original name may be "." or "..", which would refer
+				// to dir itself, or its parent.
+				if rel, err := filepath.Rel(dest, originalPath); err != nil || rel == "." || isOutsideRoot(rel) {
+					return 0, breakoutError(fmt.Errorf("invalid whiteout entry %q", hdr.Name))
+				}
 				if err := os.RemoveAll(originalPath); err != nil {
 					return 0, err
 				}
 			}
 		} else {
-			// If path exits we almost always just want to remove and replace it.
+			// If dstPath exists we almost always just want to remove and replace it.
 			// The only exception is when it is a directory *and* the file from
 			// the layer is also a directory. Then we want to merge them (i.e.
 			// just apply the metadata from the layer).
-			if fi, err := os.Lstat(path); err == nil {
+			if fi, err := os.Lstat(dstPath); err == nil {
 				if !fi.IsDir() || hdr.Typeflag != tar.TypeDir {
-					if err := os.RemoveAll(path); err != nil {
+					if err := os.RemoveAll(dstPath); err != nil {
 						return 0, err
 					}
 				}
@@ -182,23 +182,29 @@ func UnpackLayer(dest string, layer io.Reader, options *TarOptions) (size int64,
 				return 0, err
 			}
 
-			if err := createTarFile(path, dest, srcHdr, srcData, options); err != nil {
+			if err := createTarFile(dstPath, dest, srcHdr, srcData, options); err != nil {
 				return 0, err
 			}
 
 			// Directory mtimes must be handled at the end to avoid further
 			// file creation in them to modify the directory mtime
 			if hdr.Typeflag == tar.TypeDir {
-				dirs = append(dirs, hdr)
+				dirs = append(dirs, unpackedDir{hdr: hdr, name: name})
 			}
-			unpackedPaths[path] = struct{}{}
+			unpackedPaths[dstPath] = struct{}{}
 		}
 	}
 
-	for _, hdr := range dirs {
-		// #nosec G305 -- The header was checked for path traversal before it was appended to the dirs slice.
-		path := filepath.Join(dest, hdr.Name)
-		if err := chtimes(path, hdr.AccessTime, hdr.ModTime); err != nil {
+	for _, d := range dirs {
+		// Resolve the directory again, as later entries may have replaced
+		// it, or one of its parents, with a symlink.
+		name, err := resolveInRoot(dest, d.name)
+		if err != nil {
+			return 0, err
+		}
+		// #nosec G305 -- The name is resolved within dest.
+		dstPath := filepath.Join(dest, name)
+		if err := chtimes(dstPath, d.hdr.AccessTime, d.hdr.ModTime); err != nil {
 			return 0, err
 		}
 	}
